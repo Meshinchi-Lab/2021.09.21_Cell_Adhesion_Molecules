@@ -1,0 +1,294 @@
+---
+title: "CBFA2T3-GLIS2 Cell Adhesion Genes"
+author: "Jenny Smith"
+date: "9/21/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"/2018.02.12_AML_Specific_Transcripts/2021.09.21_Cell_Adhesion_Molecules"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+library(REDCapR)
+# library(keyring) #cannot install non-zero exit 
+
+getwd()
+```
+
+
+# Raw Counts
+
+```{r}
+current_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/"))
+# current_files
+```
+
+```{r}
+cts_grch38_file <- grep("_RBD_scaledTPM_counts.RDS", current_files, value=TRUE)
+cts_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",cts_grch38_file))
+cts_grch38_ids <- cts_grch38[,grep("gene_id","gene_name")]
+
+
+head(cts_grch38[,1:5])
+dim(cts_grch38) #58263  3023
+```
+
+```{r}
+TPM_grch38_file <- grep("_RBD_.+Abundance_TPM", current_files, value=TRUE)
+TPM_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",TPM_grch38_file))
+TPM_grch38_ids <- TPM_grch38[,grep("gene_id|gene_name", colnames(TPM_grch38))]
+
+TPM_grch38 <- as.data.frame(TPM_grch38)
+rownames(TPM_grch38) <-  TPM_grch38_ids$gene_id
+TPM_grch38 <- TPM_grch38[,-grep("gene_id|gene_name", colnames(TPM_grch38))]
+
+
+head(TPM_grch38)
+dim(TPM_grch38) #58263  3021
+```
+
+# Gene Annotations
+
+```{r}
+geneIDmap <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>% 
+  filter(gene_id %in% TPM_grch38_ids$gene_id)
+
+head(geneIDmap)
+# dim(geneIDmap) # 58263    23
+# View(geneIDmap)
+```
+
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html 
+project <- "CBFA2T3-GLIS2_Cell_Adhesion_Gene_Expression"
+current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+project_log <- paste0(project,".log")
+
+#start a project log file to track the input expression matrixes 
+#again I need some sort of version control... how??
+if(!file.exists(project_log)){
+  project_logfile <- cat(paste0("Date: ", as.character(Sys.Date())),
+                       paste0(c("cts: ","TPM: "), c(cts_grch38_file,TPM_grch38_file)), 
+                       sep="\n",file = project_log)
+}
+
+
+if(file.exists(current_cde_database)){
+  readRDS(current_cde_database)
+    
+}else{
+  path_credential <- file.path(HOME,".redcap")
+  project_id <- 1295
+
+  credential  <- REDCapR::retrieve_credential_local(
+    path_credential = path_credential,
+    project_id = project_id)
+  
+  #takes about 30 sec to download. 
+  merged <- redcap_read(redcap_uri = credential$redcap_uri, 
+                        token = credential$token, 
+                        raw_or_label_headers = 'label')
+  if(merged$success){
+    merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+    saveRDS(merged, current_cde_database)
+  }
+  
+}
+
+#keep a list of the ineligable patiens to remove if necessary
+inelig <- merged %>% 
+  filter(Eligibility.Comments == "remove") %>% 
+  pull(USI)
+
+#Filter those with USIs and are eligible for the study
+merged <- merged %>% 
+  filter(!is.na(USI), !grepl("Unknown", USI)) %>% 
+  filter(Eligibility.Comments != "remove")
+
+
+dim(merged) #2217  156
+head(merged)
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+
+table(sample_info$Group)
+# table(sample_info$Time_point)
+```
+
+
+# Define Sample 
+
+```{r}
+dx_samples <- sample_info %>% 
+  filter(!grepl("_replicate", Sample)) %>% 
+  filter(grepl("NBM|CD34_PB", Time_point) | Time_point=="diagnostic" ) %>% 
+  filter(grepl("^AML$|NBM|CD34_PB", Group)) %>% 
+  filter(Sample %in% colnames(TPM_grch38))
+
+
+table(dx_samples$Time_point)
+table(dx_samples$AML_Subtype)
+```
+
+# Subset Counts/TPMs
+
+```{r}
+TPMs <- TPM_grch38[,dx_samples$Sample]
+
+
+head(TPMs[,1:5])
+# dim(TPMs)
+```
+
+# DEGs 
+
+```{r}
+CBFGLIS.degs <- dir("../DEGs/") %>% 
+  grep("CBFA2T3GLIS2.+", ., value = TRUE)
+```
+
+```{r}
+# the DE expression was completed on all ENSGs IDs, but the expression data was de-duplicated gene_names which map to multiple ENSG IDs
+#So need to include the de-duplicated gene IDs and gene_names
+CBFGLISvsAML <- read.csv(file.path(PROJHOME,"0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsOthers_DEGs.csv")) %>% 
+  filter(gene %in% TPM_grch38_ids$gene_id) 
+
+dim(CBFGLISvsAML) #7428   15
+# head(CBFGLISvsAML, n=10)
+```
+
+```{r}
+CBFGLISvsNBM <- read.csv(file.path(PROJHOME, "0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsNBM_DEGs.csv")) %>% 
+   filter(gene %in% TPM_grch38_ids$gene_id)
+
+dim(CBFGLISvsNBM) #7428   15
+# head(CBFGLISvsNBM, n=10)
+```
+
+
+# Cell Adesion Gene Expression 
+
+```{r}
+adhesion_mols_ids <- geneIDmap %>% 
+  filter(Cell_Adhesion_Gene=="Yes") %>% 
+  mutate(misannotation=case_when(
+    Cell_Adhesion_Gene=="Yes" & Cell_Surface_Protein=="Yes" ~ "", #will need to check these as they are primarily HPA antibody staining evidence
+    Cell_Adhesion_Gene=="Yes" & grepl("Transcription|Transcription regulation", Uniprot_Keywords) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & grepl("MIR[0-9]|MIRLET[0-9]", gene_name) ~ "Yes",
+    Cell_Adhesion_Gene=="Yes" & c(is.na(Cellular.Compartment_Membrane)) & 
+      !c(grepl("Cell adhesion|Secreted|Signal|Cell junction", Uniprot_Keywords) | grepl("Cell Junctions", Additional.location_HumanProteinAtlas)) ~ "ambiguous",
+    TRUE ~ "")) %>% 
+  filter(misannotation != "Yes")
+
+
+head(adhesion_mols_ids)
+dim(adhesion_mols_ids) # 996  24 
+table(adhesion_mols_ids$misannotation) #84 to be cleaned up, 76 need additional or updated information from DBs
+```
+
+
+```{r}
+adhesion_mols <- TPMs[rownames(TPMs) %in% adhesion_mols_ids$gene_id, ] %>% 
+  rownames_to_column("gene_id") %>% 
+  pivot_longer(cols=matches("^TARGET"),
+               values_to = "TPM", names_to="Sample") %>% 
+  left_join(., dx_samples, by="Sample") %>% 
+  inner_join(., adhesion_mols_ids, by=c("gene_id"="gene_id")) %>% 
+  left_join(., select(CBFGLISvsNBM, gene,
+                      "CBFGLIS_vs_NBM_logFC"=logFC,
+                      "CBFGLIS_vs_NBM_adj.p.Val"=adj.P.Val), 
+            by=c("gene_id"="gene")) %>% 
+  left_join(., select(CBFGLISvsAML, gene,
+                      "CBFGLIS_vs_AML_logFC"=logFC, 
+                      "CBFGLIS_vs_AML_adj.p.Val"=adj.P.Val), 
+            by=c("gene_id"="gene")) %>% 
+  
+  #clean and sort the genes by log2FC
+  mutate_at(vars(matches("logFC")), ~round(., digits=2)) %>% 
+  filter(!is.na(CBFGLIS_vs_NBM_logFC) | !is.na(CBFGLIS_vs_NBM_logFC)) %>% 
+  filter(CBFGLIS_vs_NBM_logFC > 1 | CBFGLIS_vs_AML_logFC > 1) %>% 
+  arrange(desc(CBFGLIS_vs_NBM_logFC), desc(CBFGLIS_vs_AML_logFC)) %>% 
+  
+  #order the columns
+  select(Sample, USI, AML_Subtype, Cell_Adhesion_Gene,
+         Cell_Surface_Protein, gene_name,gene_id, TPM,
+         matches("vs"), everything())
+
+
+head(adhesion_mols)
+```
+
+```{r}
+manual_check <-  filter(adhesion_mols, misannotation=="ambiguous")  %>% 
+  select(Cell_Adhesion_Gene,Cell_Surface_Protein,misannotation, gene_name:gene_id,Cellular.Compartment_Membrane,Uniprot_Keywords) %>%
+  distinct()
+
+dim(manual_check) #9 were found to be ambigious and don't seem to add much to the dataset. 
+# write.csv(manual_check, "Cell_Adhesion_Gene_without_Cell_Surface_Annotation.csv")
+```
+
+```{r}
+adhesion_mols_cbfglis <- adhesion_mols %>% 
+  filter(grepl("CBFA2T3-GLIS2|NBM|CD34_PB", AML_Subtype)) %>% 
+  filter(misannotation != "ambiguous") %>% #remove the 9 genes for now until they can be definitiely Yes
+  select(-misannotation) %>% 
+  arrange(AML_Subtype,desc(CBFGLIS_vs_NBM_logFC),gene_name, desc(TPM))
+
+
+head(adhesion_mols_cbfglis)
+# dim(adhesion_mols_cbfglis)
+# table(adhesion_mols_cbfglis$gene_name, adhesion_mols_cbfglis$misannotation)
+
+# unique(adhesion_mols_cbfglis$gene_name)
+
+
+# write.csv(adhesion_mols_cbfglis,"TARGET_AML_CBFA2T3-GLIS2_Cell_Adhesion_Genes_OverExpressed.csv", row.names = FALSE)
+```
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
